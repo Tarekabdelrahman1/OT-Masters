@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: fitgear
+      POSTGRES_USER: fitgear_user
+      POSTGRES_PASSWORD: change_me
+    ports:
+      - "5432:5432"
+    volumes:
+      - fitgear_pgdata:/var/lib/postgresql/data
+      - ./backend/src/db/schema.sql:/docker-entrypoint-initdb.d/1-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fitgear_user -d fitgear"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      DB_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  fitgear_pgdata:

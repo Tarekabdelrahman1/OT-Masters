@@ -1,0 +1,15 @@
+:root {
+  --iron: #151517;
+  --iron-2: #1d1e21;
+  --concrete: #28292d;
+  --chalk: #EDE9DF;
+  --chalk-dim: #B7B2A6;
+  --load: #FF4E1F;
+  --load-dim: #a83814;
+  --steel: #7d8494;
+  --line: rgba(237, 233, 223, 0.12);
+
+  --font-display: 'Anton', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
