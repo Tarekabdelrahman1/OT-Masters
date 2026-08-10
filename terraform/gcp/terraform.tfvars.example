@@ -1,0 +1,39 @@
+project_id = "<YOUR_GCP_PROJECT_ID>"
+
+region      = "europe-west1"
+environment = "devsecops"
+cluster_name = "devsecops-gke"
+
+# Use YOUR PUBLIC internet IPv4 address, not 192.168.x.x / 10.x.x.x.
+# Example command:
+#   printf '%s/32\n' "$(curl -4 -fsSL https://ifconfig.me)"
+admin_cidr = "<YOUR_PUBLIC_IP>/32"
+
+node_locations = [
+  "europe-west1-b",
+  "europe-west1-c"
+]
+
+node_ipv4_cidr    = "10.10.0.0/20"
+pod_ipv4_cidr     = "10.20.0.0/16"
+service_ipv4_cidr = "10.30.0.0/20"
+master_ipv4_cidr  = "172.16.0.0/28"
+
+flow_log_sampling = 0.5
+
+# Lab phase:
+# private nodes + restricted public control-plane endpoint.
+# We will switch this to true later when a private admin path exists.
+enable_private_endpoint = false
+
+release_channel = "REGULAR"
+
+machine_type      = "e2-standard-4"
+node_disk_size_gb = 80
+
+node_pool_total_min = 2
+node_pool_total_max = 6
+
+# Keep false for the lab while we are iterating.
+# Turn it on when we stabilize the platform.
+deletion_protection = false

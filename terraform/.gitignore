@@ -1,0 +1,24 @@
+# Terraform local state / working files
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Variable files can contain account/project-specific values
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Backend configuration can contain environment-specific values
+backend.hcl
+
+# Terraform CLI config
+.terraformrc
+terraform.rc
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

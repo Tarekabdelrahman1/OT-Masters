@@ -1,0 +1,21 @@
+aws_region = "eu-central-1"
+
+repository_name       = "devsecops-webapp"
+jenkins_iam_user_name = "jenkins-devsecops-ecr"
+
+# Fill this only AFTER the GCP network stack creates its static Cloud NAT IP:
+#
+#   cd ../gcp-platform
+#   terraform output -raw nat_public_ip
+#
+jenkins_source_cidrs = [
+  "<GCP_CLOUD_NAT_PUBLIC_IP>/32"
+]
+
+untagged_image_expiry_days = 7
+max_images                  = 50
+
+# ECR scanning configuration is registry-level.
+# Keep true for a dedicated lab AWS account.
+# Set false if an organization/security team already manages registry scanning.
+manage_registry_scanning = true
