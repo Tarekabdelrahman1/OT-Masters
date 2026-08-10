@@ -1,27 +1,3 @@
--vm:~/devsecops/OT-Masters/terraform$ cd aws/
-Tarek@devsecops-vm:~/devsecops/OT-Masters/terraform/aws$ cat main.tf
-module "ecr" {
-  source = "../modules/aws-ecr"
-
-  repository_name       = var.repository_name
-  jenkins_iam_user_name = var.jenkins_iam_user_name
-  jenkins_source_cidrs  = var.jenkins_source_cidrs
-
-  untagged_image_expiry_days = var.untagged_image_expiry_days
-  max_images                 = var.max_images
-  manage_registry_scanning   = var.manage_registry_scanning
-
-  tags = {
-    Environment = "devsecops-lab"
-    ManagedBy   = "terraform"
-    Project     = "devsecops-maste# DevSecOps Terraform Infrastructure — Detailed Guide
-
-This document explains the Terraform part of the DevSecOps project in detail: what every folder does, why each resource exists, how the modules connect together, what security problem each setting solves, and how the GCP and AWS parts fit into the final Jenkins + Argo CD + GKE architecture.
-
-> **Project goal:** build a security-focused DevSecOps platform where the application runs on **GKE in GCP**, container images are stored in **Amazon ECR**, Jenkins performs CI and security scanning, and Argo CD performs GitOps-based deployment.
-
----
-
 # 1. Big Picture
 
 Terraform is responsible only for the **cloud infrastructure layer**.
