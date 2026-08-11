@@ -1,0 +1,2512 @@
+# DevSecOps Application Deployment Runbook
+## GKE + Docker + AWS ECR + Kubernetes
+
+This README covers the phase **after the GCP Terraform infrastructure is running**.
+
+It is written as a practical runbook for this architecture:
+
+```text
+Source Code
+    |
+    v
+Docker Build
+    |
+    v
+Security Checks
+    |
+    v
+AWS ECR
+    |
+    v
+Private GKE Nodes
+    |
+    v
+Kubernetes Deployment
+    |
+    v
+Kubernetes Service
+    |
+    v
+Staging Verification
+    |
+    v
+Later: Jenkins -> GitOps Repo -> Argo CD
+```
+
+---
+
+# 1. Current Infrastructure
+
+Known GCP values:
+
+```bash
+export PROJECT_ID="devops-project-503113"
+export REGION="europe-west1"
+export CLUSTER_NAME="devsecops-gke"
+export NODE_POOL="devsecops-gke-primary"
+```
+
+Current GCP architecture:
+
+```text
+GCP Project: devops-project-503113
+|
++-- VPC: devsecops-vpc
+|
++-- GKE subnet: devsecops-gke-subnet
+|
++-- Private GKE Worker Nodes
+|
++-- Regional GKE Cluster: devsecops-gke
+|
++-- Workload Identity Federation for GKE
+|
++-- Cloud NAT
+|    |
+|    +-- Static Public IP: 35.205.238.62
+|
++-- GKE Node Service Account
+```
+
+The application images are intended to live in **AWS ECR**, not Google Artifact Registry.
+
+---
+
+# 2. Important Rule Before We Start
+
+There are two deployment modes in this project.
+
+## Phase A — Manual validation
+
+We manually:
+
+```text
+build image
+-> push image to ECR
+-> configure temporary ECR pull authentication
+-> deploy to GKE
+-> verify application
+```
+
+This is useful while learning and debugging.
+
+## Phase B — Final GitOps architecture
+
+Later the deployment flow becomes:
+
+```text
+Developer
+   |
+   v
+GitHub Source Repository
+   |
+   v
+Jenkins
+   |
+   +-- Gitleaks
+   +-- SonarQube
+   +-- Trivy
+   +-- Build
+   +-- Push image to ECR
+   |
+   v
+Update GitOps Repository
+   |
+   v
+Argo CD
+   |
+   v
+GKE
+```
+
+In the final architecture Jenkins should **not** deploy the application with:
+
+```bash
+kubectl apply
+```
+
+and should **not** directly run:
+
+```bash
+helm upgrade
+```
+
+Jenkins builds and verifies artifacts, then updates Git desired state.
+
+Argo CD performs reconciliation.
+
+For now, manual `kubectl` is only for learning and initial validation.
+
+---
+
+# 3. Recommended Repository Structure
+
+A useful project structure is:
+
+```text
+OT-Masters/
+|
++-- terraform/
+|   |
+|   +-- gcp/
+|   +-- aws/
+|   +-- modules/
+|
++-- app/
+|   |
+|   +-- Dockerfile
+|   +-- .dockerignore
+|   +-- source-code...
+|
++-- k8s/
+|   |
+|   +-- base/
+|   |   |
+|   |   +-- deployment.yaml
+|   |   +-- service.yaml
+|   |   +-- serviceaccount.yaml
+|   |
+|   +-- staging/
+|   |
+|   +-- production/
+|
++-- security/
+|
++-- scripts/
+```
+
+Your current files do not have to match this structure exactly.
+
+Do **not** move working files just to match this README.
+
+First understand what you already have.
+
+---
+
+# 4. Step 0 — Verify the Cluster
+
+Before Docker or Kubernetes deployment work, verify that the cluster is reachable.
+
+```bash
+export PROJECT_ID="devops-project-503113"
+export REGION="europe-west1"
+export CLUSTER_NAME="devsecops-gke"
+```
+
+Configure `kubectl`:
+
+```bash
+gcloud container clusters get-credentials "$CLUSTER_NAME" \
+  --region "$REGION" \
+  --project "$PROJECT_ID"
+```
+
+Check the context:
+
+```bash
+kubectl config current-context
+```
+
+Expected context should reference:
+
+```text
+devops-project-503113
+europe-west1
+devsecops-gke
+```
+
+Check nodes:
+
+```bash
+kubectl get nodes -o wide
+```
+
+Worker nodes should eventually show:
+
+```text
+STATUS
+Ready
+```
+
+Check system workloads:
+
+```bash
+kubectl get pods -A
+```
+
+Useful diagnostic:
+
+```bash
+kubectl cluster-info
+```
+
+Do not continue to application deployment if the Kubernetes API itself is unreachable.
+
+---
+
+# 5. Step 1 — Inspect the Application Before Building
+
+Move to the application directory.
+
+Example:
+
+```bash
+cd ~/devsecops/OT-Masters/app
+```
+
+Inspect the files:
+
+```bash
+ls -lah
+```
+
+Inspect Dockerfile:
+
+```bash
+cat Dockerfile
+```
+
+Inspect `.dockerignore`:
+
+```bash
+cat .dockerignore
+```
+
+Before building, answer these questions.
+
+## Dockerfile review checklist
+
+### Base image
+
+Example:
+
+```dockerfile
+FROM node:22-alpine
+```
+
+Ask:
+
+- Do we need this entire image?
+- Is the image maintained?
+- Is the version explicitly selected?
+- Can we use a smaller runtime image?
+
+### Multi-stage build
+
+A production Dockerfile often separates:
+
+```text
+Build stage
+    |
+    v
+Runtime stage
+```
+
+This reduces unnecessary compilers, package managers, source files, and build dependencies in the final image.
+
+### Container user
+
+Avoid running the application as root when possible.
+
+Example concept:
+
+```dockerfile
+USER app
+```
+
+### Secrets
+
+Never put secrets in:
+
+```dockerfile
+ENV AWS_SECRET_ACCESS_KEY=...
+COPY credentials ...
+RUN echo password ...
+```
+
+Anything copied into an image can potentially become part of the image layers.
+
+### `.dockerignore`
+
+Typical exclusions:
+
+```text
+.git
+.gitignore
+.env
+*.pem
+*.key
+terraform/
+node_modules/
+security-reports/
+```
+
+Do not blindly copy this list; adapt it to the application.
+
+---
+
+# 6. Step 2 — Build the Image Locally
+
+First verify Docker:
+
+```bash
+docker version
+```
+
+If your user intentionally does not belong to the Docker group, use:
+
+```bash
+sudo docker version
+```
+
+Set local variables:
+
+```bash
+export APP_NAME="devsecops-webapp"
+export IMAGE_TAG="manual-001"
+```
+
+Build:
+
+```bash
+docker build \
+  -t "${APP_NAME}:${IMAGE_TAG}" \
+  .
+```
+
+If Docker requires sudo:
+
+```bash
+sudo docker build \
+  -t "${APP_NAME}:${IMAGE_TAG}" \
+  .
+```
+
+Check the image:
+
+```bash
+docker images
+```
+
+Inspect:
+
+```bash
+docker image inspect "${APP_NAME}:${IMAGE_TAG}"
+```
+
+---
+
+# 7. Step 3 — Run the Container Locally
+
+Before Kubernetes, prove that the container itself works.
+
+Example if the application listens on container port `8080`:
+
+```bash
+docker run --rm \
+  -p 8080:8080 \
+  "${APP_NAME}:${IMAGE_TAG}"
+```
+
+From another terminal:
+
+```bash
+curl -v http://127.0.0.1:8080/
+```
+
+Replace ports according to your application.
+
+The important distinction is:
+
+```text
+Docker problem?
+or
+Kubernetes problem?
+```
+
+If the image does not work with plain Docker, Kubernetes normally will not fix the application.
+
+---
+
+# 8. Step 4 — Run Basic Security Checks
+
+These commands are useful before pushing an image.
+
+## Gitleaks
+
+From the repository root:
+
+```bash
+gitleaks detect \
+  --source . \
+  --redact
+```
+
+Purpose:
+
+```text
+Source repository
+      |
+      v
+Search for accidentally committed secrets
+```
+
+Examples:
+
+- API keys
+- private keys
+- tokens
+- passwords
+- cloud credentials
+
+## Trivy filesystem scan
+
+```bash
+trivy fs \
+  --severity HIGH,CRITICAL \
+  .
+```
+
+## Trivy image scan
+
+```bash
+trivy image \
+  --severity HIGH,CRITICAL \
+  "${APP_NAME}:${IMAGE_TAG}"
+```
+
+Later Jenkins will automate these steps.
+
+For the learning phase, run them manually so you understand what CI will eventually do.
+
+---
+
+# 9. Step 5 — Verify AWS Authentication
+
+Before ECR work:
+
+```bash
+aws sts get-caller-identity
+```
+
+Confirm that:
+
+- the AWS account is correct;
+- you are using the intended identity;
+- credentials are not hardcoded in Terraform;
+- credentials are not stored in Git.
+
+Do not continue if you do not recognize the returned AWS account or identity.
+
+---
+
+# 10. Step 6 — Create or Verify ECR
+
+If the AWS Terraform stack has **not** been applied yet, do that before pushing application images.
+
+Move to:
+
+```bash
+cd ~/devsecops/OT-Masters/terraform/aws
+```
+
+Check the Terraform values:
+
+```bash
+cat terraform.tfvars
+```
+
+The GCP Cloud NAT public IP for this project is:
+
+```text
+35.205.238.62
+```
+
+The AWS Terraform design uses that as:
+
+```hcl
+jenkins_source_cidrs = [
+  "35.205.238.62/32"
+]
+```
+
+That restriction is intended for traffic originating from the GKE environment through Cloud NAT.
+
+Then:
+
+```bash
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan -out=aws.tfplan
+```
+
+Review:
+
+```bash
+terraform show aws.tfplan
+```
+
+Do not apply if you see an unexpected destroy.
+
+Apply only after review:
+
+```bash
+terraform apply aws.tfplan
+```
+
+Show outputs:
+
+```bash
+terraform output
+```
+
+Get the repository URL if the Terraform output provides it:
+
+```bash
+terraform output -raw repository_url
+```
+
+If your output name differs, run:
+
+```bash
+terraform output
+```
+
+and use the actual output name.
+
+---
+
+# 11. Step 7 — Discover ECR Values
+
+Set the intended AWS region and repository.
+
+Example:
+
+```bash
+export AWS_REGION="eu-central-1"
+export ECR_REPOSITORY="devsecops-webapp"
+```
+
+Get AWS account ID:
+
+```bash
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
+  --query Account \
+  --output text)"
+```
+
+Build registry URI:
+
+```bash
+export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+```
+
+Build repository URI:
+
+```bash
+export ECR_REPO="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+```
+
+Check:
+
+```bash
+echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID"
+echo "ECR_REGISTRY=$ECR_REGISTRY"
+echo "ECR_REPO=$ECR_REPO"
+```
+
+Verify repository:
+
+```bash
+aws ecr describe-repositories \
+  --region "$AWS_REGION" \
+  --repository-names "$ECR_REPOSITORY"
+```
+
+---
+
+# 12. Step 8 — Authenticate Docker to ECR
+
+Use:
+
+```bash
+aws ecr get-login-password \
+  --region "$AWS_REGION" \
+| docker login \
+  --username AWS \
+  --password-stdin "$ECR_REGISTRY"
+```
+
+Amazon ECR authorization tokens are temporary.
+
+At the time this README was prepared, AWS documents that ECR authorization tokens are valid for **12 hours**.
+
+This matters later for GKE image pulling.
+
+Do not design the final platform around manually creating one permanent Kubernetes ECR secret.
+
+---
+
+# 13. Step 9 — Tag the Image for ECR
+
+Current local image:
+
+```text
+devsecops-webapp:manual-001
+```
+
+Tag it:
+
+```bash
+docker tag \
+  "${APP_NAME}:${IMAGE_TAG}" \
+  "${ECR_REPO}:${IMAGE_TAG}"
+```
+
+Check:
+
+```bash
+docker images
+```
+
+---
+
+# 14. Step 10 — Push the Image to ECR
+
+Push:
+
+```bash
+docker push "${ECR_REPO}:${IMAGE_TAG}"
+```
+
+Verify:
+
+```bash
+aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY"
+```
+
+---
+
+# 15. Do Not Use `latest` as the Final Deployment Strategy
+
+Avoid final production manifests like:
+
+```yaml
+image: example/image:latest
+```
+
+The tag `latest` does not tell you exactly which image content should run.
+
+Prefer an immutable release identity such as a Git commit SHA.
+
+Example CI tag:
+
+```bash
+IMAGE_TAG="$(git rev-parse --short HEAD)"
+```
+
+Then:
+
+```text
+devsecops-webapp:a91c73e
+```
+
+Even better for final GitOps desired state:
+
+```text
+repository@sha256:<digest>
+```
+
+A digest identifies the exact image content.
+
+---
+
+# 16. Step 11 — Retrieve the ECR Image Digest
+
+After pushing:
+
+```bash
+export IMAGE_DIGEST="$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids imageTag="$IMAGE_TAG" \
+  --query 'imageDetails[0].imageDigest' \
+  --output text)"
+```
+
+Check:
+
+```bash
+echo "$IMAGE_DIGEST"
+```
+
+Expected format:
+
+```text
+sha256:...
+```
+
+Build immutable image reference:
+
+```bash
+export IMAGE_REF="${ECR_REPO}@${IMAGE_DIGEST}"
+```
+
+Check:
+
+```bash
+echo "$IMAGE_REF"
+```
+
+This is the type of reference the GitOps repository should eventually store.
+
+---
+
+# 17. Step 12 — Inspect Existing Kubernetes Manifests
+
+Before applying anything:
+
+```bash
+cd ~/devsecops/OT-Masters
+```
+
+Locate YAML:
+
+```bash
+find . \
+  -type f \
+  \( -name "*.yaml" -o -name "*.yml" \) \
+  -print
+```
+
+If manifests are under `k8s/`:
+
+```bash
+find k8s -maxdepth 3 -type f -print
+```
+
+Inspect each file:
+
+```bash
+cat k8s/<file>.yaml
+```
+
+Do not run `kubectl apply -f k8s/` until you understand what every manifest creates.
+
+---
+
+# 18. Kubernetes Objects You Will Usually Need
+
+For a simple web application:
+
+```text
+Namespace
+   |
+ServiceAccount
+   |
+ConfigMap / Secret if needed
+   |
+Deployment
+   |
+Pods
+   |
+Service
+```
+
+Later we can add:
+
+```text
+NetworkPolicy
+PodDisruptionBudget
+Ingress / Gateway
+HorizontalPodAutoscaler
+External Secrets / Vault integration
+Gatekeeper policies
+```
+
+Do not add everything on day one.
+
+---
+
+# 19. Step 13 — Namespaces
+
+Create separate environments.
+
+Example staging namespace:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+```
+
+Production:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+```
+
+Apply declared manifests:
+
+```bash
+kubectl apply -f k8s/namespaces/
+```
+
+Or temporarily:
+
+```bash
+kubectl create namespace staging
+kubectl create namespace production
+```
+
+Verify:
+
+```bash
+kubectl get namespaces
+```
+
+For the final GitOps architecture, namespaces should normally be declared as code rather than created manually.
+
+---
+
+# 20. Step 14 — Deployment Manifest Review
+
+A basic Deployment looks conceptually like:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: staging
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: webapp
+
+  template:
+    metadata:
+      labels:
+        app: webapp
+
+    spec:
+      containers:
+        - name: webapp
+          image: REPLACE_WITH_ECR_IMAGE
+          ports:
+            - containerPort: 8080
+```
+
+Understand each level:
+
+```text
+Deployment
+   |
+   +-- desired replicas
+   |
+   +-- selector
+   |
+   +-- Pod template
+          |
+          +-- container
+                |
+                +-- image
+                +-- ports
+```
+
+---
+
+# 21. Deployment Selector Rule
+
+These labels must match:
+
+```yaml
+selector:
+  matchLabels:
+    app: webapp
+```
+
+and:
+
+```yaml
+template:
+  metadata:
+    labels:
+      app: webapp
+```
+
+Think:
+
+```text
+Deployment selector
+       |
+       +---- finds ----> Pods
+```
+
+---
+
+# 22. Container Port
+
+Example:
+
+```yaml
+ports:
+  - containerPort: 8080
+```
+
+This describes the port used by the process inside the container.
+
+It does **not** by itself expose the application to the Internet.
+
+For external or internal access, Kubernetes uses a `Service` and optionally an Ingress/Gateway/load balancer.
+
+---
+
+# 23. Step 15 — Add Resource Requests and Limits
+
+Do not leave workloads completely unbounded.
+
+Example:
+
+```yaml
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+```
+
+Concept:
+
+```text
+request
+=
+capacity Kubernetes should reserve for scheduling
+
+limit
+=
+upper resource boundary for the container
+```
+
+Tune these based on real application measurements.
+
+Do not blindly use these example numbers in production.
+
+---
+
+# 24. Step 16 — Add Health Probes
+
+A web application should usually expose a useful health endpoint.
+
+Example:
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 20
+```
+
+The application must actually implement the chosen endpoint.
+
+## Readiness
+
+Answers:
+
+```text
+Should Kubernetes send traffic to this Pod?
+```
+
+## Liveness
+
+Answers:
+
+```text
+Is this container still healthy enough to keep running?
+```
+
+---
+
+# 25. Step 17 — Basic Container Security Context
+
+Where compatible with the application, a useful security baseline is:
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+```
+
+A stronger configuration may include:
+
+```yaml
+readOnlyRootFilesystem: true
+```
+
+but only if the application supports it.
+
+Use writable volumes for paths that genuinely require writes.
+
+---
+
+# 26. Step 18 — ServiceAccount
+
+Do not automatically run every application with a powerful Kubernetes identity.
+
+Example:
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp
+  namespace: staging
+```
+
+Deployment:
+
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: webapp
+```
+
+Later, Workload Identity Federation can map Kubernetes workload identity to controlled Google Cloud permissions without JSON service-account keys.
+
+The application should not inherit the GKE node service account's permissions.
+
+---
+
+# 27. Step 19 — AWS ECR Pull Authentication
+
+This is one of the most important cross-cloud issues in this architecture.
+
+The worker nodes are on GCP GKE while the private registry is AWS ECR.
+
+For a **temporary manual test**, we can create a Kubernetes image pull secret.
+
+Do not commit the generated secret to Git.
+
+Set:
+
+```bash
+export AWS_REGION="eu-central-1"
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
+  --query Account \
+  --output text)"
+export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+```
+
+Retrieve a temporary password:
+
+```bash
+export ECR_PASSWORD="$(aws ecr get-login-password \
+  --region "$AWS_REGION")"
+```
+
+Create secret in staging:
+
+```bash
+kubectl create secret docker-registry ecr-registry \
+  --namespace staging \
+  --docker-server="$ECR_REGISTRY" \
+  --docker-username="AWS" \
+  --docker-password="$ECR_PASSWORD"
+```
+
+Then remove the password from the shell variable:
+
+```bash
+unset ECR_PASSWORD
+```
+
+Verify only metadata:
+
+```bash
+kubectl get secret ecr-registry \
+  -n staging
+```
+
+Do not print or decode the secret unnecessarily.
+
+---
+
+# 28. Attach `imagePullSecrets`
+
+In the Deployment Pod template:
+
+```yaml
+spec:
+  template:
+    spec:
+      imagePullSecrets:
+        - name: ecr-registry
+```
+
+Example:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  namespace: staging
+
+spec:
+  template:
+    spec:
+      serviceAccountName: webapp
+
+      imagePullSecrets:
+        - name: ecr-registry
+
+      containers:
+        - name: webapp
+          image: ACCOUNT.dkr.ecr.REGION.amazonaws.com/devsecops-webapp@sha256:...
+```
+
+The secret must exist in the **same namespace** as the Pod.
+
+---
+
+# 29. ECR Authentication Warning
+
+The manual `ecr-registry` secret is **not the final production solution**.
+
+ECR authorization tokens expire.
+
+Therefore this architecture has a real lifecycle problem:
+
+```text
+ECR token created
+     |
+     v
+Kubernetes Secret
+     |
+     v
+token expires
+     |
+     v
+existing cached images may continue to run
+but
+new pulls can fail
+```
+
+This becomes particularly important when:
+
+```text
+a new node is created
+a Pod is rescheduled
+a new Deployment rolls out
+an image is not cached
+```
+
+We will later implement a proper short-lived/federated or securely refreshed authentication design as part of the Vault/cloud identity phase.
+
+Do not put a permanent AWS access key into a Kubernetes YAML file.
+
+---
+
+# 30. Step 20 — Service Manifest Review
+
+Example:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp
+  namespace: staging
+
+spec:
+  selector:
+    app: webapp
+
+  ports:
+    - port: 80
+      targetPort: 8080
+
+  type: ClusterIP
+```
+
+Understand the ports:
+
+```text
+Client inside cluster
+      |
+      | port 80
+      v
+Kubernetes Service
+      |
+      | targetPort 8080
+      v
+Application Pod
+```
+
+---
+
+# 31. `ClusterIP` vs `LoadBalancer`
+
+## ClusterIP
+
+```yaml
+type: ClusterIP
+```
+
+Application is reachable inside the cluster only.
+
+This is useful during early testing and avoids immediately creating an external cloud load balancer.
+
+You can test using:
+
+```bash
+kubectl port-forward \
+  -n staging \
+  service/webapp \
+  8080:80
+```
+
+Then:
+
+```bash
+curl http://127.0.0.1:8080
+```
+
+## LoadBalancer
+
+```yaml
+type: LoadBalancer
+```
+
+On GKE this can provision Google Cloud load-balancing infrastructure.
+
+That is useful when required, but it adds cloud resources and potential cost.
+
+For early staging tests, start with `ClusterIP` unless you specifically need public access.
+
+---
+
+# 32. Step 21 — Validate Manifests Before Applying
+
+Client-side check:
+
+```bash
+kubectl apply \
+  --dry-run=client \
+  -f k8s/staging/
+```
+
+When appropriate, server-side dry run:
+
+```bash
+kubectl apply \
+  --dry-run=server \
+  -f k8s/staging/
+```
+
+Check differences against the live cluster:
+
+```bash
+kubectl diff \
+  -f k8s/staging/
+```
+
+Review the output before applying.
+
+---
+
+# 33. Step 22 — Deploy to Staging
+
+For the initial manual validation only:
+
+```bash
+kubectl apply \
+  -f k8s/staging/
+```
+
+Then:
+
+```bash
+kubectl get all \
+  -n staging
+```
+
+---
+
+# 34. Step 23 — Use the Exact ECR Image
+
+If the manifest still has a placeholder image, you can temporarily set the immutable image manually.
+
+Example:
+
+```bash
+kubectl set image \
+  deployment/webapp \
+  webapp="$IMAGE_REF" \
+  -n staging
+```
+
+This manual command is for validation.
+
+In the final GitOps workflow the digest should be committed to the GitOps repository instead.
+
+---
+
+# 35. Step 24 — Watch the Rollout
+
+```bash
+kubectl rollout status \
+  deployment/webapp \
+  -n staging \
+  --timeout=5m
+```
+
+Check Pods:
+
+```bash
+kubectl get pods \
+  -n staging \
+  -o wide
+```
+
+Check Deployment:
+
+```bash
+kubectl get deployment \
+  -n staging
+```
+
+Check Service:
+
+```bash
+kubectl get service \
+  -n staging
+```
+
+---
+
+# 36. Step 25 — Inspect Pod Events
+
+If a Pod fails:
+
+```bash
+kubectl describe pod \
+  -n staging \
+  <POD_NAME>
+```
+
+Look near:
+
+```text
+Events:
+```
+
+Common reasons include:
+
+```text
+ImagePullBackOff
+ErrImagePull
+CrashLoopBackOff
+CreateContainerConfigError
+FailedScheduling
+Readiness probe failed
+Liveness probe failed
+```
+
+---
+
+# 37. `ImagePullBackOff`
+
+If you see `ImagePullBackOff`:
+
+```bash
+kubectl describe pod \
+  -n staging \
+  <POD_NAME>
+```
+
+Then verify:
+
+```bash
+kubectl get secret \
+  -n staging
+```
+
+Confirm `ecr-registry` exists.
+
+Check the Deployment:
+
+```bash
+kubectl get deployment webapp \
+  -n staging \
+  -o yaml
+```
+
+Look for:
+
+```yaml
+imagePullSecrets:
+  - name: ecr-registry
+```
+
+Also verify the ECR image exists:
+
+```bash
+aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY"
+```
+
+---
+
+# 38. Recreate the Temporary ECR Secret
+
+For manual testing only:
+
+```bash
+export ECR_PASSWORD="$(aws ecr get-login-password \
+  --region "$AWS_REGION")"
+```
+
+Then:
+
+```bash
+kubectl create secret docker-registry ecr-registry \
+  --namespace staging \
+  --docker-server="$ECR_REGISTRY" \
+  --docker-username="AWS" \
+  --docker-password="$ECR_PASSWORD" \
+  --dry-run=client \
+  -o yaml \
+| kubectl apply -f -
+```
+
+Then:
+
+```bash
+unset ECR_PASSWORD
+```
+
+Restart the Deployment if needed:
+
+```bash
+kubectl rollout restart \
+  deployment/webapp \
+  -n staging
+```
+
+Watch:
+
+```bash
+kubectl rollout status \
+  deployment/webapp \
+  -n staging
+```
+
+Again: this is a lab workaround, not the final credential architecture.
+
+---
+
+# 39. `CrashLoopBackOff`
+
+If the image successfully pulls but the container keeps restarting:
+
+```bash
+kubectl logs \
+  -n staging \
+  <POD_NAME>
+```
+
+Previous crashed container:
+
+```bash
+kubectl logs \
+  -n staging \
+  <POD_NAME> \
+  --previous
+```
+
+Inspect configuration:
+
+```bash
+kubectl describe pod \
+  -n staging \
+  <POD_NAME>
+```
+
+Typical causes:
+
+```text
+incorrect application port
+missing environment variable
+missing config file
+application cannot reach dependency
+bad command/entrypoint
+permission problem
+read-only filesystem conflict
+```
+
+---
+
+# 40. Step 26 — Test the Application
+
+For a `ClusterIP` Service:
+
+```bash
+kubectl port-forward \
+  -n staging \
+  service/webapp \
+  8080:80
+```
+
+From another terminal:
+
+```bash
+curl -v \
+  http://127.0.0.1:8080/
+```
+
+For an API health endpoint:
+
+```bash
+curl -v \
+  http://127.0.0.1:8080/health
+```
+
+Use the real endpoint implemented by your application.
+
+---
+
+# 41. Step 27 — Verify Service Routing
+
+Check Service:
+
+```bash
+kubectl describe service \
+  webapp \
+  -n staging
+```
+
+Check EndpointSlices:
+
+```bash
+kubectl get endpointslices \
+  -n staging
+```
+
+If the Service has no backend endpoints, compare Pod labels:
+
+```bash
+kubectl get pods \
+  -n staging \
+  --show-labels
+```
+
+with Service selector:
+
+```bash
+kubectl get service webapp \
+  -n staging \
+  -o yaml
+```
+
+The Service selector must match the Pod labels.
+
+---
+
+# 42. Step 28 — Basic Rollback
+
+Check rollout history:
+
+```bash
+kubectl rollout history \
+  deployment/webapp \
+  -n staging
+```
+
+Rollback:
+
+```bash
+kubectl rollout undo \
+  deployment/webapp \
+  -n staging
+```
+
+Then:
+
+```bash
+kubectl rollout status \
+  deployment/webapp \
+  -n staging
+```
+
+In the final GitOps model, rollback normally means reverting desired state in Git and letting Argo CD reconcile it.
+
+---
+
+# 43. Step 29 — Staging Before Production
+
+Do not deploy a brand-new image directly to production.
+
+Desired flow:
+
+```text
+Build image once
+      |
+      v
+ECR image digest
+      |
+      v
+Staging
+      |
+      +-- functional validation
+      +-- security validation
+      +-- DAST
+      |
+      v
+Promote the SAME digest
+      |
+      v
+Production
+```
+
+Important:
+
+```text
+Do not rebuild a different image for production.
+```
+
+Promote the image that was actually tested.
+
+---
+
+# 44. Step 30 — OWASP ZAP Later
+
+Once staging has a reachable URL:
+
+```text
+staging endpoint
+      |
+      v
+OWASP ZAP
+      |
+      v
+DAST findings
+      |
+      v
+DefectDojo
+```
+
+Only scan systems you own or are authorized to test.
+
+---
+
+# 45. Step 31 — Kubernetes NetworkPolicy
+
+Dataplane V2 is already enabled in the GKE design.
+
+That gives us the network policy enforcement capability.
+
+But Dataplane V2 by itself does not mean all Pod traffic is automatically isolated.
+
+Later we should introduce policies such as:
+
+```text
+default deny
+    |
+    +-- explicitly allow required traffic
+```
+
+NetworkPolicy should be introduced carefully after we understand the actual traffic flows.
+
+---
+
+# 46. Step 32 — Secrets
+
+Do not put application secrets directly in Git like:
+
+```yaml
+env:
+  - name: DB_PASSWORD
+    value: "super-secret"
+```
+
+Even this:
+
+```yaml
+kind: Secret
+data:
+  password: <base64>
+```
+
+is **not encryption** by itself.
+
+Base64 is encoding.
+
+The intended project direction is:
+
+```text
+HashiCorp Vault
+     |
+     v
+controlled secret delivery
+     |
+     v
+Kubernetes workload
+```
+
+We will design that separately instead of mixing long-lived secrets into application manifests.
+
+---
+
+# 47. Step 33 — Kubernetes Security Baseline
+
+Before production, review every Deployment for:
+
+```text
+[ ] non-root where supported
+[ ] no privileged container
+[ ] no hostPID unless explicitly required
+[ ] no hostNetwork unless explicitly required
+[ ] no hostPath unless explicitly required
+[ ] drop unnecessary capabilities
+[ ] no privilege escalation
+[ ] resource requests
+[ ] resource limits
+[ ] readiness probe
+[ ] liveness/startup probe
+[ ] dedicated ServiceAccount
+[ ] immutable image digest
+[ ] no embedded secrets
+```
+
+Some platform security tools such as Falco may legitimately require more host access than an ordinary application.
+
+Treat those as explicit security exceptions, not defaults.
+
+---
+
+# 48. Step 34 — Check What Kubernetes Actually Created
+
+Useful commands:
+
+```bash
+kubectl get all -n staging
+kubectl get deployments -n staging
+kubectl get replicasets -n staging
+kubectl get pods -n staging -o wide
+kubectl get services -n staging
+kubectl get serviceaccounts -n staging
+kubectl get configmaps -n staging
+kubectl get secrets -n staging
+```
+
+Do not print secret values unless you actually need them for debugging.
+
+---
+
+# 49. Step 35 — Understand the Kubernetes Relationship
+
+This relationship is fundamental:
+
+```text
+Deployment
+    |
+    v
+ReplicaSet
+    |
+    v
+Pods
+```
+
+And separately:
+
+```text
+Service
+   |
+   | label selector
+   v
+Pods
+```
+
+A Service does not "contain" the Deployment.
+
+It finds Pods through labels.
+
+---
+
+# 50. Step 36 — Check Image Running in the Cluster
+
+See the configured image:
+
+```bash
+kubectl get deployment webapp \
+  -n staging \
+  -o jsonpath='{.spec.template.spec.containers[*].image}'
+echo
+```
+
+Inspect actual Pod image IDs:
+
+```bash
+kubectl get pods \
+  -n staging \
+  -o jsonpath='{range .items[*]}{.metadata.name}{" => "}{.status.containerStatuses[*].imageID}{"\n"}{end}'
+```
+
+This is useful to verify that Kubernetes is running the expected image digest.
+
+---
+
+# 51. Step 37 — Do Not Edit Live Resources as the Normal Workflow
+
+Avoid making normal changes with:
+
+```bash
+kubectl edit deployment webapp
+```
+
+Why?
+
+Because then:
+
+```text
+Git manifest
+    !=
+Live Kubernetes state
+```
+
+That is configuration drift.
+
+During debugging it can sometimes be useful, but the final answer must be moved back into version-controlled configuration.
+
+---
+
+# 52. Step 38 — Transition to GitOps
+
+Once manual deployment works, stop treating `kubectl apply` as the normal CD mechanism.
+
+Create the GitOps repository structure.
+
+Example:
+
+```text
+webapp-gitops/
+|
++-- base/
+|   |
+|   +-- deployment.yaml
+|   +-- service.yaml
+|   +-- serviceaccount.yaml
+|
++-- overlays/
+    |
+    +-- staging/
+    |
+    +-- production/
+```
+
+The exact organization can use plain YAML, Kustomize, or Helm depending on the project's final choice.
+
+Do not introduce multiple templating systems unless they solve a real requirement.
+
+---
+
+# 53. Final Image Promotion Model
+
+Recommended model:
+
+```text
+Source commit
+   |
+   v
+Jenkins build
+   |
+   v
+Image pushed to ECR
+   |
+   v
+sha256:ABC
+   |
+   +-------------------------+
+   |                         |
+   v                         v
+staging Git config      later production config
+sha256:ABC              sha256:ABC
+```
+
+The artifact remains unchanged.
+
+Only deployment promotion changes.
+
+---
+
+# 54. Jenkins Responsibilities Later
+
+Jenkins should eventually perform steps such as:
+
+```text
+Checkout
+   |
+Gitleaks
+   |
+SAST
+   |
+Dependency / SCA scan
+   |
+Docker build
+   |
+Trivy image scan
+   |
+SBOM
+   |
+Optional signing / attestation
+   |
+Push to ECR
+   |
+Update GitOps repository with image digest
+```
+
+Jenkins should not become the Kubernetes control plane administrator.
+
+---
+
+# 55. Argo CD Responsibilities Later
+
+Argo CD watches the GitOps repository.
+
+Concept:
+
+```text
+Git desired state
+       |
+       v
+Argo CD
+       |
+compare
+       |
+       +----> GKE actual state
+       |
+reconcile
+```
+
+This gives us a cleaner separation:
+
+```text
+CI = Jenkins
+CD = Argo CD
+```
+
+---
+
+# 56. Planned Platform Components
+
+After the basic application deployment works, a sensible learning order is:
+
+```text
+1. Application Docker image works locally
+
+2. Image reaches ECR
+
+3. Application runs manually on GKE
+
+4. Clean Kubernetes manifests
+
+5. Staging namespace
+
+6. GitOps repository
+
+7. Argo CD
+
+8. Jenkins
+
+9. CI security gates
+   - Gitleaks
+   - SonarQube
+   - Trivy
+
+10. Vault
+
+11. Gatekeeper
+
+12. Falco
+
+13. OWASP ZAP
+
+14. DefectDojo
+
+15. Google Security Operations integration
+
+16. Supply-chain improvements
+    - SBOM
+    - signing
+    - attestations
+```
+
+---
+
+# 57. Cost-Conscious Testing
+
+While learning, avoid creating unnecessary public cloud resources.
+
+For an application test, prefer:
+
+```yaml
+type: ClusterIP
+```
+
+plus:
+
+```bash
+kubectl port-forward
+```
+
+instead of creating a separate public `LoadBalancer` Service every time.
+
+When external ingress is genuinely required, design it intentionally.
+
+---
+
+# 58. Sleeping the GKE Lab
+
+This project has previously used a manual "sleep" process by scaling worker nodes to zero.
+
+Before doing that, remember:
+
+```text
+GKE control plane remains
+worker compute is removed
+```
+
+Do not run application tests while nodes are at zero.
+
+Also remember that manual `gcloud` changes can temporarily create drift from Terraform desired state.
+
+After waking the lab, use:
+
+```bash
+cd ~/devsecops/OT-Masters/terraform/gcp
+terraform plan
+```
+
+to understand whether actual infrastructure still matches Terraform.
+
+Do not blindly apply a plan without reviewing it.
+
+---
+
+# 59. Full Manual Deployment Checklist
+
+```text
+[ ] GKE cluster reachable
+[ ] Worker nodes Ready
+[ ] Dockerfile reviewed
+[ ] .dockerignore reviewed
+[ ] Image builds locally
+[ ] Container works locally
+[ ] Gitleaks completed
+[ ] Trivy filesystem scan completed
+[ ] Trivy image scan completed
+[ ] Correct AWS account confirmed
+[ ] ECR repository exists
+[ ] Docker authenticated to ECR
+[ ] Image tagged uniquely
+[ ] Image pushed to ECR
+[ ] Image digest recorded
+[ ] staging namespace exists
+[ ] ECR temporary imagePullSecret exists
+[ ] Deployment reviewed
+[ ] Service reviewed
+[ ] resource requests/limits reviewed
+[ ] probes reviewed
+[ ] securityContext reviewed
+[ ] ServiceAccount reviewed
+[ ] kubectl dry-run successful
+[ ] kubectl diff reviewed
+[ ] staging manifests applied
+[ ] rollout successful
+[ ] Pods Running/Ready
+[ ] Service has endpoints
+[ ] application reachable through port-forward
+[ ] exact running image/digest verified
+```
+
+---
+
+# 60. Compact Command Flow
+
+Do **not** blindly paste this block until the individual values match your application.
+
+It exists to show the overall sequence.
+
+```bash
+# GCP / GKE
+export PROJECT_ID="devops-project-503113"
+export REGION="europe-west1"
+export CLUSTER_NAME="devsecops-gke"
+
+gcloud container clusters get-credentials "$CLUSTER_NAME" \
+  --region "$REGION" \
+  --project "$PROJECT_ID"
+
+kubectl get nodes -o wide
+
+# Application
+cd ~/devsecops/OT-Masters/app
+
+export APP_NAME="devsecops-webapp"
+export IMAGE_TAG="manual-001"
+
+docker build -t "${APP_NAME}:${IMAGE_TAG}" .
+
+trivy image \
+  --severity HIGH,CRITICAL \
+  "${APP_NAME}:${IMAGE_TAG}"
+
+# AWS / ECR
+export AWS_REGION="eu-central-1"
+export ECR_REPOSITORY="devsecops-webapp"
+
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity \
+  --query Account \
+  --output text)"
+
+export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+export ECR_REPO="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+aws ecr get-login-password \
+  --region "$AWS_REGION" \
+| docker login \
+  --username AWS \
+  --password-stdin "$ECR_REGISTRY"
+
+docker tag \
+  "${APP_NAME}:${IMAGE_TAG}" \
+  "${ECR_REPO}:${IMAGE_TAG}"
+
+docker push "${ECR_REPO}:${IMAGE_TAG}"
+
+export IMAGE_DIGEST="$(aws ecr describe-images \
+  --region "$AWS_REGION" \
+  --repository-name "$ECR_REPOSITORY" \
+  --image-ids imageTag="$IMAGE_TAG" \
+  --query 'imageDetails[0].imageDigest' \
+  --output text)"
+
+export IMAGE_REF="${ECR_REPO}@${IMAGE_DIGEST}"
+echo "$IMAGE_REF"
+
+# Temporary ECR auth for staging
+export ECR_PASSWORD="$(aws ecr get-login-password \
+  --region "$AWS_REGION")"
+
+kubectl create secret docker-registry ecr-registry \
+  --namespace staging \
+  --docker-server="$ECR_REGISTRY" \
+  --docker-username="AWS" \
+  --docker-password="$ECR_PASSWORD" \
+  --dry-run=client \
+  -o yaml \
+| kubectl apply -f -
+
+unset ECR_PASSWORD
+
+# Kubernetes staging
+cd ~/devsecops/OT-Masters
+
+kubectl apply --dry-run=server -f k8s/staging/
+kubectl diff -f k8s/staging/
+kubectl apply -f k8s/staging/
+
+kubectl get all -n staging
+
+kubectl rollout status \
+  deployment/webapp \
+  -n staging \
+  --timeout=5m
+
+kubectl get pods -n staging -o wide
+```
+
+---
+
+# 61. Troubleshooting Cheat Sheet
+
+## Kubernetes API timeout
+
+```bash
+kubectl cluster-info
+```
+
+Refresh credentials:
+
+```bash
+gcloud container clusters get-credentials "$CLUSTER_NAME" \
+  --region "$REGION" \
+  --project "$PROJECT_ID"
+```
+
+Also check GKE authorized networks if your admin public IP changed.
+
+## No nodes
+
+```bash
+kubectl get nodes
+```
+
+Check node pool:
+
+```bash
+gcloud container node-pools describe \
+  devsecops-gke-primary \
+  --cluster devsecops-gke \
+  --region europe-west1 \
+  --project devops-project-503113
+```
+
+## `Pending` Pod
+
+```bash
+kubectl describe pod -n staging <POD>
+```
+
+Look for `FailedScheduling`.
+
+## `ImagePullBackOff`
+
+```bash
+kubectl describe pod -n staging <POD>
+```
+
+Check:
+
+```text
+image reference
+ECR repository
+imagePullSecret
+namespace
+ECR auth expiration
+IAM permissions
+```
+
+## `CrashLoopBackOff`
+
+```bash
+kubectl logs -n staging <POD>
+kubectl logs -n staging <POD> --previous
+```
+
+## Service does not work
+
+```bash
+kubectl get pods -n staging --show-labels
+kubectl get svc webapp -n staging -o yaml
+```
+
+Compare Pod labels with Service selector.
+
+---
+
+# 62. Security Rules for This Phase
+
+Never commit:
+
+```text
+AWS access keys
+GCP service-account JSON files
+ECR passwords
+Kubernetes pull-secret values
+Vault root tokens
+application passwords
+private keys
+.env files containing secrets
+```
+
+Do not use `0.0.0.0/0` for sensitive management interfaces unless there is a deliberate, reviewed reason and another strong control.
+
+Do not run the application as privileged without a justified requirement.
+
+Do not give application Pods node-level cloud credentials.
+
+Do not store `latest` as the final GitOps image reference.
+
+---
+
+# 63. What We Should Review Together Next
+
+The best next review order for your existing application files is:
+
+```text
+1. Dockerfile
+2. .dockerignore
+3. Kubernetes Namespace
+4. Kubernetes ServiceAccount
+5. Kubernetes Deployment
+6. Kubernetes Service
+7. ConfigMap
+8. Secrets design
+9. health probes
+10. resource requests and limits
+11. securityContext
+12. NetworkPolicy
+13. staging/production differences
+```
+
+For each file we should use the same review model:
+
+```text
+What does this line do?
+
+Tool side:
+how does Docker/Kubernetes interpret it?
+
+Cloud side:
+what does GCP/AWS/Kubernetes actually create or change?
+
+Why was it added?
+
+What happens if we remove it?
+
+What is the security impact?
+
+What are the alternatives?
+
+What would an interviewer/reviewer ask about it?
+```
+
+---
+
+# 64. Official References
+
+This runbook was aligned with official documentation current when it was prepared.
+
+Google Cloud — `gcloud container clusters get-credentials`:
+
+```text
+https://docs.cloud.google.com/sdk/gcloud/reference/container/clusters/get-credentials
+```
+
+AWS — Pushing an image to Amazon ECR:
+
+```text
+https://docs.aws.amazon.com/AmazonECR/latest/userguide/docker-push-ecr-image.html
+```
+
+AWS — ECR private registry authentication:
+
+```text
+https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry_auth.html
+```
+
+Kubernetes — Pull an image from a private registry:
+
+```text
+https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/
+```
+
+Kubernetes — `kubectl rollout status`:
+
+```text
+https://kubernetes.io/docs/reference/kubectl/generated/kubectl_rollout/kubectl_rollout_status/
+```
+
+---
+
+# 65. Final Mental Model
+
+```text
+                    SOURCE CODE
+                         |
+                         v
+                     Dockerfile
+                         |
+                         v
+                    Docker Image
+                         |
+                Security Scanning
+                         |
+                         v
+                      AWS ECR
+                         |
+                    image digest
+                         |
+                         v
+                  Kubernetes YAML
+                         |
+                         v
+                     Deployment
+                         |
+                         v
+                        Pods
+                         |
+                         v
+                      Service
+                         |
+                         v
+                      Staging
+                         |
+                Functional + DAST
+                         |
+                         v
+                     Promotion
+                         |
+                         v
+                    Production
+
+
+FINAL AUTOMATION:
+
+Developer
+   |
+GitHub Source Repo
+   |
+Jenkins CI
+   |
+ECR
+   |
+GitOps Repo
+   |
+Argo CD
+   |
+GKE
+```
+
+The immediate goal is **not** to install the entire DevSecOps platform at once.
+
+The immediate goal is:
+
+```text
+one application
+one image
+one ECR repository
+one staging deployment
+one working service
+fully understood
+```
+
+Once that path works and you understand every part, automate it.
