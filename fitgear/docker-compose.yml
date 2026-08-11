@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -20,7 +18,7 @@ services:
 
   backend:
     build: ./backend
-    env_file: ./backend/.env
+    env_file: ./backend/.env.example
     environment:
       DB_HOST: postgres
     depends_on:
@@ -34,7 +32,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "8080:80"
+      - "9988:80"
 
 volumes:
   fitgear_pgdata:
