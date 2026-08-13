@@ -207,13 +207,7 @@ sudo -n sh "$DOCKER_BENCH_DIR/docker-bench-security.sh" \
                 sh '''#!/bin/bash
 set -euo pipefail
 
-docker build \
-    --pull \
-    --label "org.opencontainers.image.revision=$GIT_SHA" \
-    --label "org.opencontainers.image.source=$GIT_SOURCE_URL" \
-    -t "$IMAGE_URI" \
-    -f backend/Dockerfile \
-    backend
+docker build --pull --label "org.opencontainers.image.revision=$GIT_SHA" --label "org.opencontainers.image.source=$GIT_SOURCE_URL" -t "$IMAGE_URI" -f fitgear/backend/Dockerfile fitgear/backend
 '''
             }
         }

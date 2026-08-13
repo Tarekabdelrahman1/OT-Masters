@@ -1,0 +1,11 @@
+name: docker-runtime-hardening
+title: Docker Runtime Security Hardening Profile
+maintainer: Omar Hesham
+copyright: Fitgear
+license: Apache-2.0
+summary: Verify the security configurations of the read-only validation container.
+version: 1.0.0
+inputs:
+  - name: container_id
+    type: string
+    required: true
