@@ -56,7 +56,7 @@ pipeline {
         GITOPS_BRANCH   = 'main'
         GITOPS_APP_PATH = "apps/${APP_NAME}/overlays/${ENVIRONMENT}"
 
-        DEFECTDOJO_URL          = 'http://defectdojo.internal.fitgear.io'
+        DEFECTDOJO_URL           = 'http://35.229.95.172:8081'
         DEFECTDOJO_ENGAGEMENT_ID = '1'
 
         TRIVY_FS_REPORT    = 'trivy-fs-report.json'
